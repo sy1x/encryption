@@ -5,9 +5,9 @@ import {
 } from 'node:crypto'
 import { constants } from 'node:fs'
 import {
-  link, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, rmdir, unlink,
+  link, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, rmdir, unlink,
 } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { homedir, hostname, release } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { Writable } from 'node:stream'
@@ -22,7 +22,7 @@ const identityPath = join(vault, 'identity.json')
 const optionsPath = join(vault, 'options.json')
 const sessionLock = join(project, '.vault-session')
 const resetPath = join(project, '.vault-reset')
-const projectFiles = new Set(['vault.sh', 'vault.mjs', 'README.md', '.gitignore'])
+const projectFiles = new Set(['vault.sh', 'vault.mjs', 'eff_large_wordlist.txt', 'README.md', '.gitignore'])
 const stop = new AbortController()
 const derivePassword = promisify(scrypt)
 const legacyMagic = Buffer.from('LVLT0001')
@@ -43,6 +43,9 @@ function display(value) {
 }
 
 function panel(title) {
+  if (process.stdout.isTTY && process.env.TERM !== 'dumb') {
+    process.stdout.write('\x1b[2J\x1b[H')
+  }
   const line = '+--------------------------------------------+'
   const banner = line + '\n| ' + title.padEnd(42) + ' |\n' + line
   print(color ? '\x1b[1;36m' + banner + '\x1b[0m' : banner)
@@ -208,6 +211,47 @@ function normalizeWords(words) {
   return words.trim().replace(/\s+/gu, ' ')
 }
 
+async function generateWords() {
+  const data = await readFile(join(project, 'eff_large_wordlist.txt'))
+  const checksum = createHash('sha256').update(data).digest('hex')
+  if (checksum !== 'addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e') {
+    throw new Error('The bundled EFF word list is damaged. Restore eff_large_wordlist.txt.')
+  }
+  const words = data.toString('utf8').trim().split(/\r?\n/u)
+    .map(line => line.split('\t')[1]).filter(word => /^[a-z]+$/u.test(word))
+  const choices = words.length ** 2
+  const limit = Math.floor(2 ** 32 / choices) * choices
+  const context = JSON.stringify({
+    purpose: 'Local Vault random word pairs v1',
+    unixMilliseconds: Date.now(),
+    monotonicNanoseconds: process.hrtime.bigint().toString(),
+    hostname: hostname(),
+    platform: process.platform,
+    architecture: process.arch,
+    release: release(),
+    processId: process.pid,
+    userId: process.getuid(),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  })
+  // Time and environment provide context. The fresh OS seed supplies unpredictability.
+  const seed = randomBytes(32)
+  let counter = 0
+  try {
+    return Array.from({ length: 5 }, () => {
+      let candidate
+      do {
+        const block = createHmac('sha256', seed).update(context).update(String(counter++)).digest()
+        candidate = block.readUInt32BE(0)
+      } while (candidate >= limit)
+      // Rejection sampling keeps all word pairs equally likely.
+      const index = candidate % choices
+      return words[Math.floor(index / words.length)] + '-' + words[index % words.length]
+    }).join(' ')
+  } finally {
+    seed.fill(0)
+  }
+}
+
 async function initialize(ask) {
   if ((await readdir(files)).some(name => name.endsWith('.lvlt'))) {
     throw new Error('Vault identity is missing. Restore identity.json to recover files or run ./vault.sh --reset to erase them.')
@@ -215,24 +259,39 @@ async function initialize(ask) {
   panel('LOCAL VAULT / SETUP')
   print('  [1] Traditional password')
   print('  [2] Choose your own five words')
-  const choice = (await ask('Choose 1 or 2 (Enter cancels)> ')).trim()
+  print('  [3] Generate five random word pairs')
+  const choice = (await ask('Choose 1, 2, or 3 (Enter cancels)> ')).trim()
   if (choice === '') return null
-  if (choice !== '1' && choice !== '2') throw new Error('Choose 1 or 2 to initialize the vault.')
+  if (!['1', '2', '3'].includes(choice)) throw new Error('Choose 1, 2, or 3 to initialize the vault.')
   const mode = choice === '1' ? 'password' : 'words'
   let password
   if (mode === 'words') {
-    for (;;) {
-      password = normalizeWords(await ask('Enter five words separated by spaces (Enter cancels)> ', true))
-      if (!password) return null
-      if (password.split(' ').length === 5) break
-      print('Enter exactly five words.')
+    if (choice === '3') {
+      password = await generateWords()
+      panel('LOCAL VAULT / GENERATED WORDS')
+      print('  Record all five word pairs in order, including the hyphens.')
+      password.split(' ').forEach(word => print('  ' + word))
+      await ask('Press Enter when recorded to hide the phrase> ')
+    } else {
+      let message = ''
+      for (;;) {
+        panel('LOCAL VAULT / FIVE WORDS')
+        if (message) print(message)
+        password = normalizeWords(await ask('Enter five words separated by spaces (Enter cancels)> ', true))
+        if (!password) return null
+        if (password.split(' ').length === 5) break
+        message = 'Enter exactly five words.'
+      }
     }
+    panel('LOCAL VAULT / CONFIRM WORDS')
     const confirmation = normalizeWords(await ask('Re-enter the five words (Enter cancels)> ', true))
     if (!confirmation) return null
     if (confirmation !== password) throw new Error('The five words did not match. Setup was canceled.')
   } else {
-    password = await ask('New password (at least 14 characters)> ', true)
-    if ([...password].length < 14) throw new Error('The password must be at least 14 characters.')
+    panel('LOCAL VAULT / PASSWORD')
+    password = await ask('New password (Enter cancels)> ', true)
+    if (password === '') return null
+    panel('LOCAL VAULT / CONFIRM PASSWORD')
     if (password !== await ask('Confirm password> ', true)) throw new Error('The passwords did not match.')
   }
   const identity = {
@@ -258,9 +317,11 @@ async function initialize(ask) {
 
 async function unlock(ask, identity) {
   validateIdentity(identity)
-  panel('LOCAL VAULT / UNLOCK')
   const label = identity.mode === 'words' ? 'Five words' : 'Password'
+  let message = ''
   for (;;) {
+    panel('LOCAL VAULT / UNLOCK')
+    if (message) print(message)
     let password = await ask(label + ' (Enter cancels)> ', true)
     if (password === '') return null
     if (identity.mode === 'words') password = normalizeWords(password)
@@ -269,7 +330,7 @@ async function unlock(ask, identity) {
       return key
     }
     key.fill(0)
-    print('Incorrect ' + label.toLowerCase() + '.')
+    message = 'Incorrect ' + label.toLowerCase() + '.'
   }
 }
 
@@ -468,6 +529,7 @@ async function importFile(path, key) {
 
 async function encryptedEntries(key) {
   const entries = []
+  const warnings = []
   const items = await readdir(files, { withFileTypes: true })
   for (const item of items) {
     if (!item.isFile() || !/^[a-f0-9]{64}\.lvlt$/u.test(item.name)) continue
@@ -478,12 +540,13 @@ async function encryptedEntries(key) {
       const { name, size } = await readHeader(input, key)
       entries.push({ path, name, size, id: item.name.slice(0, 12) })
     } catch (error) {
-      print('Skipping ' + display(item.name) + '. ' + error.message)
+      warnings.push('Skipping ' + display(item.name) + '. ' + error.message)
     } finally {
       await input?.close()
     }
   }
-  return entries.sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id))
+  entries.sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id))
+  return { entries, warnings }
 }
 
 async function checkoutFile(entry, key) {
@@ -593,31 +656,34 @@ function launch(path) {
 
 const pageSize = 12
 
-async function select(ask, items, label) {
+async function select(ask, items, label, title, context = '') {
   let page = 0
+  let message = ''
   const pages = Math.max(1, Math.ceil(items.length / pageSize))
   for (;;) {
+    panel(title)
+    if (context) print(context)
     const visible = items.slice(page * pageSize, (page + 1) * pageSize)
     visible.forEach((item, index) => print('  [' + (index + 1) + '] ' + label(item)))
     const navigation = pages > 1
       ? '  [N] Next  [P] Previous  (' + (page + 1) + '/' + pages + ')'
       : ''
     if (navigation) print(navigation)
+    if (message) print(message)
     const choice = (await ask('Select a number (Enter goes back)> ')).trim().toLowerCase()
+    message = ''
     if (!choice) return null
     if (choice === 'n' && pages > 1) page = (page + 1) % pages
     else if (choice === 'p' && pages > 1) page = (page + pages - 1) % pages
     else if (/^[1-9]\d?$/u.test(choice) && Number(choice) <= visible.length) {
       return visible[Number(choice) - 1]
-    } else print('Choose one of the listed numbers.')
+    } else message = 'Choose one of the listed numbers.'
   }
 }
 
 async function browse(ask) {
   let directory = await realpath(process.cwd())
-  panel('LOCAL VAULT / BROWSE')
   for (;;) {
-    print('\n' + display(directory))
     const entries = []
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name)
@@ -630,7 +696,8 @@ async function browse(ask) {
       Number(right.directory) - Number(left.directory) || left.name.localeCompare(right.name))
     if (directory === project) entries.unshift({ name: 'Checked-out files', directory: true, path: checkouts })
     entries.unshift({ name: '..', directory: true, path: dirname(directory) })
-    const chosen = await select(ask, entries, entry => display(entry.name) + (entry.directory ? '/' : ''))
+    const chosen = await select(ask, entries, entry => display(entry.name) + (entry.directory ? '/' : ''),
+      'LOCAL VAULT / BROWSE', display(directory))
     if (!chosen || !chosen.directory) return chosen?.path
     directory = chosen.path
   }
@@ -683,28 +750,38 @@ async function menu(ask, key) {
     print('  [O] Options')
     print('  [Q] Quit')
     const input = await ask('VAULT> ')
+    let showResult = false
     try {
       switch (input.trim().toLowerCase()) {
         case 'q':
           return
         case 'b': {
           const path = await browse(ask)
-          if (path) await importFile(path, key)
+          if (path) {
+            panel('LOCAL VAULT / ENCRYPT')
+            await importFile(path, key)
+            showResult = true
+          }
           break
         }
         case 'c': {
           panel('LOCAL VAULT / CHECKOUT')
-          const entries = await encryptedEntries(key)
+          const { entries, warnings } = await encryptedEntries(key)
+          warnings.forEach(message => print(message))
           if (entries.length === 0) {
             print('No encrypted files available.')
+            showResult = true
             break
           }
+          if (warnings.length) await ask('Press Enter to view available files> ')
           const selected = await select(ask, entries, item =>
-            display(item.name) + '  ' + item.size + ' B  [' + item.id + ']')
+            display(item.name) + '  ' + item.size + ' B  [' + item.id + ']', 'LOCAL VAULT / CHECKOUT')
           if (!selected) break
+          panel('LOCAL VAULT / CHECKOUT')
           const path = await checkoutFile(selected, key)
           print('Checked out ' + display(path))
           if (autoOpen) await launch(path)
+          showResult = true
           break
         }
         case 'o': {
@@ -713,20 +790,25 @@ async function menu(ask, key) {
           if ((await ask('[T] Toggle (Enter goes back)> ')).trim().toLowerCase() === 't') {
             await savePrivateJSON(optionsPath, { autoOpen: !autoOpen }, true)
             autoOpen = !autoOpen
+            panel('LOCAL VAULT / OPTIONS')
             print('Auto-open is ' + (autoOpen ? 'on.' : 'off.'))
+            showResult = true
           }
           break
         }
         case '':
           break
         default:
+          panel('LOCAL VAULT / ENCRYPT')
           await importFile(await droppedPath(input), key)
+          showResult = true
       }
     } catch (error) {
       if (stop.signal.aborted) throw error
       console.error('Error. ' + error.message)
+      showResult = true
     }
-    print()
+    if (showResult) await ask('Press Enter to return to the menu> ')
   }
 }
 
@@ -770,7 +852,18 @@ async function openVault(ask, reset, directImport) {
   if (reset && !await resetVault(ask)) return null
   await prepareVault()
   const identity = await readPrivateJSON(identityPath)
-  if (!identity) return initialize(ask)
+  if (!identity) {
+    const key = await initialize(ask)
+    if (key && !directImport) {
+      try {
+        await ask('Press Enter to continue> ')
+      } catch (error) {
+        key.fill(0)
+        throw error
+      }
+    }
+    return key
+  }
   if (directImport) return unlock(ask, identity)
   for (;;) {
     panel('LOCAL VAULT / START')
@@ -780,9 +873,9 @@ async function openVault(ask, reset, directImport) {
     if (choice === 'u' || choice === '') {
       const key = await unlock(ask, identity)
       if (key) return key
-    } else if (choice === 'r' && await resetVault(ask)) {
-      await prepareVault()
-      return initialize(ask)
+    } else if (choice === 'r') {
+      if (await resetVault(ask)) return openVault(ask, false, false)
+      await ask('Press Enter to return to startup> ')
     }
   }
 }
